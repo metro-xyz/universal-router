@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.17;
+pragma abicoder v2;
 
 import {V3Path} from './V3Path.sol';
 import {BytesLib} from './BytesLib.sol';
@@ -7,10 +8,18 @@ import {SafeCast} from '@uniswap/v3-core/contracts/libraries/SafeCast.sol';
 import {IUniswapV3Pool} from '@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol';
 import {IUniswapV3SwapCallback} from '@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol';
 import {Constants} from '../../../libraries/Constants.sol';
-import {RouterImmutables} from '../../../base/RouterImmutables.sol';
+import {RouterImmutables, AggregatorV3Interface} from '../../../base/RouterImmutables.sol';
 import {Permit2Payments} from '../../Permit2Payments.sol';
 import {Constants} from '../../../libraries/Constants.sol';
 import {ERC20} from 'solmate/src/tokens/ERC20.sol';
+
+interface IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+}
 
 /// @title Router for Uniswap v3 Trades
 abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3SwapCallback {
@@ -86,9 +95,20 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
             amountIn = ERC20(tokenIn).balanceOf(address(this));
         }
 
+        uint256 amountSoldUsd;
+        uint256 amountInHolder = amountIn;
+        // Get the pool trade route from calldata path
+        PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+
+        (address firstTokenIn,,) = path.decodeFirstPool();
+        address lastTokenOut;
+
         uint256 amountOut;
         while (true) {
             bool hasMultiplePools = path.hasMultiplePools();
+
+            // Decode the first pool in the path
+            (,, address tokenOut) = path.decodeFirstPool();
 
             // the outputs of prior swaps become the inputs to subsequent ones
             (int256 amount0Delta, int256 amount1Delta, bool zeroForOne) = _swap(
@@ -107,11 +127,47 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
                 path = path.skipToken();
             } else {
                 amountOut = amountIn;
+                lastTokenOut = tokenOut;
                 break;
             }
         }
 
         if (amountOut < amountOutMinimum) revert V3TooLittleReceived();
+
+        amountSoldUsd = getUSDAmount(firstTokenIn, lastTokenOut, amountInHolder, amountOut);
+        // Populate structs
+        ExchangeInfo memory exchangeInfo = getExchangeInfoV3();
+        TokenInfo memory tokenSoldInfo = getTokenInfo(firstTokenIn);
+        TokenInfo memory tokenBoughtInfo = getTokenInfo(lastTokenOut);
+        // Initialize trader balance struct
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, firstTokenIn),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, lastTokenOut),
+            tokenBoughtBalanceAfter: 0
+        });
+
+        // Check before subtracting in case we underflow
+        if (traderBalanceDetails.tokenSoldBalanceBefore >= amountInHolder) {
+            traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountInHolder;
+        } else {
+            traderBalanceDetails.tokenSoldBalanceAfter = 0;
+        }
+
+        traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
+
+        // Emit shadow event
+        emit Trade(
+            tx.origin,
+            amountSoldUsd,
+            exchangeInfo,
+            amountInHolder,
+            tokenSoldInfo,
+            amountOut,
+            tokenBoughtInfo,
+            tradeRoutePools,
+            traderBalanceDetails
+        );
     }
 
     /// @notice Performs a Uniswap v3 exact output swap
@@ -127,6 +183,20 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
         bytes calldata path,
         address payer
     ) internal {
+        // Get the pool trade route from calldata path
+        PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+        // Decode the first pool in the path
+        (address tokenIn, uint24 fee, address tokenOut) = path.decodeFirstPool();
+        // Flip tokens for accounting because it's an exact output swap
+        address flipTokenIn = tokenOut;
+        address flipTokenOut = tokenIn;
+        // Populate trader balance struct
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, flipTokenIn),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, flipTokenOut),
+            tokenBoughtBalanceAfter: 0
+        });
         maxAmountInCached = amountInMaximum;
         (int256 amount0Delta, int256 amount1Delta, bool zeroForOne) =
             _swap(-amountOut.toInt256(), recipient, path, payer, false);
@@ -136,6 +206,38 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
         if (amountOutReceived != amountOut) revert V3InvalidAmountOut();
 
         maxAmountInCached = DEFAULT_MAX_AMOUNT_IN;
+
+        // Calculate the actual amount in and the USD values
+        uint256 amountInActual = zeroForOne ? uint256(amount0Delta) : uint256(amount1Delta);
+        uint256 amountSoldUsd = getUSDAmount(flipTokenIn, flipTokenOut, amountInActual, amountOutReceived);
+
+        // Populate other info structs
+        ExchangeInfo memory exchangeInfo = getExchangeInfoV3();
+
+        TokenInfo memory tokenSoldInfo = getTokenInfo(flipTokenIn);
+        TokenInfo memory tokenBoughtInfo = getTokenInfo(flipTokenOut);
+
+        // Check before subtracting in case we underflow
+        if (traderBalanceDetails.tokenSoldBalanceBefore >= amountInActual) {
+            traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountInActual;
+        } else {
+            traderBalanceDetails.tokenSoldBalanceAfter = 0;
+        }
+
+        traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOutReceived;
+
+        // Emit shadow event
+        emit Trade(
+            tx.origin,
+            amountSoldUsd,
+            exchangeInfo,
+            amountInActual,
+            tokenSoldInfo,
+            amountOutReceived,
+            tokenBoughtInfo,
+            tradeRoutePools,
+            traderBalanceDetails
+        );
     }
 
     /// @dev Performs a single swap for both exactIn and exactOut
@@ -173,5 +275,57 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
                 )
             )
         );
+    }
+
+    /// @dev helper function to populate ExchangeInfo struct
+    function getExchangeInfoV3() private view returns (ExchangeInfo memory) {
+        return ExchangeInfo({
+            projectName: 'Uniswap',
+            projectVersion: 'UniversalRouter',
+            projectVersionDetails: 'V3SwapRouter',
+            contractAddress: address(this)
+        });
+    }
+
+    /// @dev helper function to populate PoolInfo struct
+    function getPoolInfoV3(address poolAddress) internal view returns (PoolInfo memory) {
+        IUniswapV3Pool pool = IUniswapV3Pool(poolAddress);
+
+        TokenInfo memory token0Info = getTokenInfo(pool.token0());
+        TokenInfo memory token1Info = getTokenInfo(pool.token1());
+
+        PoolInfo memory poolInfo;
+        poolInfo.token0 = token0Info;
+        poolInfo.token1 = token1Info;
+        poolInfo.poolAddress = poolAddress;
+        poolInfo.poolFee = pool.fee();
+        poolInfo.tickSpacing = pool.tickSpacing();
+        return poolInfo;
+    }
+
+    /// @dev helper function to get the pools from the path
+    function getPoolsFromPath(bytes calldata path) internal view returns (PoolInfo[] memory) {
+        uint256 numPools;
+        bytes calldata tempPath = path;
+        while (true) {
+            numPools++;
+            if (tempPath.hasMultiplePools()) {
+                tempPath = tempPath.skipToken();
+            } else {
+                break;
+            }
+        }
+        PoolInfo[] memory pools = new PoolInfo[](numPools);
+        for (uint256 i = 0; i < numPools; i++) {
+            (address tokenIn, uint24 fee, address tokenOut) = path.decodeFirstPool();
+            path = path.skipToken();
+
+            // Compute the pool address
+            address poolAddress = computePoolAddress(tokenIn, tokenOut, fee);
+
+            // Get pool info
+            pools[i] = getPoolInfoV3(poolAddress);
+        }
+        return pools;
     }
 }
