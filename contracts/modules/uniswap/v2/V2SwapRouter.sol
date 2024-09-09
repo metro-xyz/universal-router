@@ -9,6 +9,14 @@ import {Permit2Payments} from '../../Permit2Payments.sol';
 import {Constants} from '../../../libraries/Constants.sol';
 import {ERC20} from 'solmate/src/tokens/ERC20.sol';
 
+interface IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+}
+
 /// @title Router for Uniswap v2 Trades
 abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
     error V2TooLittleReceived();
@@ -57,12 +65,26 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         address[] calldata path,
         address payer
     ) internal {
+        uint256 amountInHolder = amountIn;
+
+        // Get the pool trade route from calldata path and initialize the trader balance struct
+        PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
+
         address firstPair =
             UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
         if (
             amountIn != Constants.ALREADY_PAID // amountIn of 0 to signal that the pair already has the tokens
         ) {
+            uint256 payerBalanceBefore = ERC20(path[0]).balanceOf(payer);
             payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
+            uint256 payerBalanceAfter = ERC20(path[0]).balanceOf(payer);
+            amountInHolder = payerBalanceBefore - payerBalanceAfter;
         }
 
         ERC20 tokenOut = ERC20(path[path.length - 1]);
@@ -72,6 +94,35 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
 
         uint256 amountOut = tokenOut.balanceOf(recipient) - balanceBefore;
         if (amountOut < amountOutMinimum) revert V2TooLittleReceived();
+
+        uint256 amountSoldUsd = getUSDAmount(path[0], path[path.length - 1], amountInHolder, amountOut);
+
+        // Populate structs
+        ExchangeInfo memory exchangeInfo = getExchangeInfoV2();
+        TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
+        TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
+
+        // Check before subtracting in case we underflow
+        if (traderBalanceDetails.tokenSoldBalanceBefore >= amountInHolder) {
+            traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountInHolder;
+        } else {
+            traderBalanceDetails.tokenSoldBalanceAfter = 0;
+        }
+
+        traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
+
+        // Emit shadow event
+        emit Trade(
+            tx.origin,
+            amountSoldUsd,
+            exchangeInfo,
+            amountInHolder,
+            tokenSoldInfo,
+            amountOut,
+            tokenBoughtInfo,
+            tradeRoutePools,
+            traderBalanceDetails
+        );
     }
 
     /// @notice Performs a Uniswap v2 exact output swap
@@ -87,11 +138,86 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         address[] calldata path,
         address payer
     ) internal {
+        // Get the pool trade route from calldata path and initialize the trader balance struct
+        PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
+
         (uint256 amountIn, address firstPair) =
             UniswapV2Library.getAmountInMultihop(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, amountOut, path);
         if (amountIn > amountInMaximum) revert V2TooMuchRequested();
 
         payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
         _v2Swap(path, recipient, firstPair);
+
+        uint256 amountSoldUsd = getUSDAmount(path[0], path[path.length - 1], amountIn, amountOut);
+
+        // Populate structs
+        ExchangeInfo memory exchangeInfo = getExchangeInfoV2();
+        TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
+        TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
+
+        // Check before subtracting in case we underflow
+        if (traderBalanceDetails.tokenSoldBalanceBefore >= amountIn) {
+            traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountIn;
+        } else {
+            traderBalanceDetails.tokenSoldBalanceAfter = 0;
+        }
+
+        traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
+
+        // Emit shadow event
+        emit Trade(
+            tx.origin,
+            amountSoldUsd,
+            exchangeInfo,
+            amountIn,
+            tokenSoldInfo,
+            amountOut,
+            tokenBoughtInfo,
+            tradeRoutePools,
+            traderBalanceDetails
+        );
+    }
+
+    /// @dev helper function to populate ExchangeInfo struct
+    function getExchangeInfoV2() private view returns (ExchangeInfo memory) {
+        return ExchangeInfo({
+            projectName: 'Uniswap',
+            projectVersion: 'UniversalRouter',
+            projectVersionDetails: 'V2SwapRouter',
+            contractAddress: address(this)
+        });
+    }
+
+    /// @dev helper function to populate PoolInfo struct
+    function getPoolInfoV2(address poolAddress) internal view returns (PoolInfo memory) {
+        IUniswapV2Pair pair = IUniswapV2Pair(poolAddress);
+
+        TokenInfo memory token0Info = getTokenInfo(pair.token0());
+        TokenInfo memory token1Info = getTokenInfo(pair.token1());
+
+        PoolInfo memory poolInfo;
+        poolInfo.token0 = token0Info;
+        poolInfo.token1 = token1Info;
+        poolInfo.poolAddress = poolAddress;
+        poolInfo.poolFee = 3000; // The pool's fee in hundredths of a bip, i.e. 1e-6. All UniswapV2 pools are hardcoded with a 30bps fee.
+        poolInfo.tickSpacing = 0; // UniswapV2 pools do not have ticks, so this is always hardcoded to 0.
+        return poolInfo;
+    }
+
+    /// @dev helper function to get the pools from the path
+    function getPoolsFromPath(address[] memory path) private view returns (PoolInfo[] memory) {
+        PoolInfo[] memory pools = new PoolInfo[](path.length - 1);
+        for (uint256 i = 0; i < path.length - 1; i++) {
+            address poolAddress =
+                UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[i], path[i + 1]);
+            pools[i] = getPoolInfoV2(poolAddress);
+        }
+        return pools;
     }
 }
