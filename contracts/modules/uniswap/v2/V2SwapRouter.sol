@@ -67,20 +67,12 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
     ) internal {
         uint256 amountInHolder = amountIn;
 
-        // Get the pool trade route from calldata path and initialize the trader balance struct
+        // Get the pool trade route from calldata path
         PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
-        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
-            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
-            tokenSoldBalanceAfter: 0,
-            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
-            tokenBoughtBalanceAfter: 0
-        });
 
         address firstPair =
-            UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
-        if (
-            amountIn != Constants.ALREADY_PAID // amountIn of 0 to signal that the pair already has the tokens
-        ) {
+                            UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
+        if (amountIn != Constants.ALREADY_PAID) {
             uint256 payerBalanceBefore = ERC20(path[0]).balanceOf(payer);
             payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
             uint256 payerBalanceAfter = ERC20(path[0]).balanceOf(payer);
@@ -102,6 +94,14 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
 
+        // Initialize trader balance struct
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
+
         // Check before subtracting in case we underflow
         if (traderBalanceDetails.tokenSoldBalanceBefore >= amountInHolder) {
             traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountInHolder;
@@ -110,6 +110,12 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         }
 
         traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
+
+        // Calculate swap fees
+        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
+        for (uint256 i = 0; i < tradeRoutePools.length; i++) {
+            swapFees[i] = (i == 0 ? amountInHolder : amountOut) * tradeRoutePools[i].poolFee / 1e6;
+        }
 
         // Emit shadow event
         emit Trade(
@@ -121,7 +127,9 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
             amountOut,
             tokenBoughtInfo,
             tradeRoutePools,
-            traderBalanceDetails
+            traderBalanceDetails,
+            "AMM", // tradeType
+            swapFees
         );
     }
 
@@ -138,17 +146,11 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         address[] calldata path,
         address payer
     ) internal {
-        // Get the pool trade route from calldata path and initialize the trader balance struct
+        // Get the pool trade route from calldata path
         PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
-        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
-            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
-            tokenSoldBalanceAfter: 0,
-            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
-            tokenBoughtBalanceAfter: 0
-        });
 
         (uint256 amountIn, address firstPair) =
-            UniswapV2Library.getAmountInMultihop(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, amountOut, path);
+                            UniswapV2Library.getAmountInMultihop(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, amountOut, path);
         if (amountIn > amountInMaximum) revert V2TooMuchRequested();
 
         payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
@@ -161,6 +163,14 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
 
+        // Initialize trader balance struct
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
+
         // Check before subtracting in case we underflow
         if (traderBalanceDetails.tokenSoldBalanceBefore >= amountIn) {
             traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountIn;
@@ -169,6 +179,12 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         }
 
         traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
+
+        // Calculate swap fees
+        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
+        for (uint256 i = 0; i < tradeRoutePools.length; i++) {
+            swapFees[i] = (i == 0 ? amountIn : amountOut) * tradeRoutePools[i].poolFee / 1e6;
+        }
 
         // Emit shadow event
         emit Trade(
@@ -180,7 +196,9 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
             amountOut,
             tokenBoughtInfo,
             tradeRoutePools,
-            traderBalanceDetails
+            traderBalanceDetails,
+            "AMM", // tradeType
+            swapFees
         );
     }
 

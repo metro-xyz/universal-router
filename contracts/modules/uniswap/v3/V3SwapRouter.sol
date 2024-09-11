@@ -103,30 +103,37 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
         (address firstTokenIn,,) = path.decodeFirstPool();
         address lastTokenOut;
 
+        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
         uint256 amountOut;
+        uint256 currentAmountIn = amountIn;
+        uint256 poolIndex = 0;
+
         while (true) {
             bool hasMultiplePools = path.hasMultiplePools();
 
             // Decode the first pool in the path
-            (,, address tokenOut) = path.decodeFirstPool();
+            (address tokenIn, , address tokenOut) = path.decodeFirstPool();
 
             // the outputs of prior swaps become the inputs to subsequent ones
             (int256 amount0Delta, int256 amount1Delta, bool zeroForOne) = _swap(
-                amountIn.toInt256(),
+                currentAmountIn.toInt256(),
                 hasMultiplePools ? address(this) : recipient, // for intermediate swaps, this contract custodies
                 path.getFirstPool(), // only the first pool is needed
-                payer, // for intermediate swaps, this contract custodies
+                poolIndex == 0 ? payer : address(this), // for intermediate swaps, this contract custodies
                 true
             );
 
-            amountIn = uint256(-(zeroForOne ? amount1Delta : amount0Delta));
+            uint256 poolFee = tradeRoutePools[poolIndex].poolFee;
+            swapFees[poolIndex] = currentAmountIn * poolFee / 1e6; // Fee is in hundredths of a bip, so divide by 1e6
+
+            currentAmountIn = uint256(-(zeroForOne ? amount1Delta : amount0Delta));
 
             // decide whether to continue or terminate
             if (hasMultiplePools) {
-                payer = address(this);
                 path = path.skipToken();
+                poolIndex++;
             } else {
-                amountOut = amountIn;
+                amountOut = currentAmountIn;
                 lastTokenOut = tokenOut;
                 break;
             }
@@ -135,10 +142,12 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
         if (amountOut < amountOutMinimum) revert V3TooLittleReceived();
 
         amountSoldUsd = getUSDAmount(firstTokenIn, lastTokenOut, amountInHolder, amountOut);
+
         // Populate structs
         ExchangeInfo memory exchangeInfo = getExchangeInfoV3();
         TokenInfo memory tokenSoldInfo = getTokenInfo(firstTokenIn);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(lastTokenOut);
+
         // Initialize trader balance struct
         TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
             tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, firstTokenIn),
@@ -166,7 +175,9 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
             amountOut,
             tokenBoughtInfo,
             tradeRoutePools,
-            traderBalanceDetails
+            traderBalanceDetails,
+            "AMM", // tradeType
+            swapFees
         );
     }
 
@@ -197,6 +208,10 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
             tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, flipTokenOut),
             tokenBoughtBalanceAfter: 0
         });
+
+        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
+        uint256 poolIndex = tradeRoutePools.length - 1;
+
         maxAmountInCached = amountInMaximum;
         (int256 amount0Delta, int256 amount1Delta, bool zeroForOne) =
             _swap(-amountOut.toInt256(), recipient, path, payer, false);
@@ -205,15 +220,36 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
 
         if (amountOutReceived != amountOut) revert V3InvalidAmountOut();
 
+        // Calculate the actual amount in
+        uint256 amountInActual = zeroForOne ? uint256(amount0Delta) : uint256(amount1Delta);
+
+        // Calculate swap fee for the last pool
+        uint256 poolFee = tradeRoutePools[poolIndex].poolFee;
+        swapFees[poolIndex] = amountInActual * poolFee / 1e6; // Fee is in hundredths of a bip, so divide by 1e6
+
+        // Handle multi-hop swaps
+        while (path.hasMultiplePools()) {
+            path = path.skipToken();
+            poolIndex--;
+
+            (amount0Delta, amount1Delta, zeroForOne) =
+            _swap(-amountInActual.toInt256(), address(this), path, address(this), false);
+
+            amountInActual = zeroForOne ? uint256(amount0Delta) : uint256(amount1Delta);
+
+            // Calculate swap fee for this pool
+            poolFee = tradeRoutePools[poolIndex].poolFee;
+            swapFees[poolIndex] = amountInActual * poolFee / 1e6;
+        }
+
+        if (amountInActual > amountInMaximum) revert V3TooMuchRequested();
         maxAmountInCached = DEFAULT_MAX_AMOUNT_IN;
 
-        // Calculate the actual amount in and the USD values
-        uint256 amountInActual = zeroForOne ? uint256(amount0Delta) : uint256(amount1Delta);
+        // Calculate the USD values
         uint256 amountSoldUsd = getUSDAmount(flipTokenIn, flipTokenOut, amountInActual, amountOutReceived);
 
         // Populate other info structs
         ExchangeInfo memory exchangeInfo = getExchangeInfoV3();
-
         TokenInfo memory tokenSoldInfo = getTokenInfo(flipTokenIn);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(flipTokenOut);
 
@@ -236,7 +272,9 @@ abstract contract V3SwapRouter is RouterImmutables, Permit2Payments, IUniswapV3S
             amountOutReceived,
             tokenBoughtInfo,
             tradeRoutePools,
-            traderBalanceDetails
+            traderBalanceDetails,
+            "AMM", // tradeType
+            swapFees
         );
     }
 
