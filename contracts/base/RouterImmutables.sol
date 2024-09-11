@@ -50,7 +50,8 @@ contract RouterImmutables {
         PoolInfo[] tradeRoutePools,
         TraderBalanceDetails traderBalanceDetails,
         string tradeType,
-        uint256[] swapFees
+        uint256[] swapFees,
+        uint256[] swapFeesUSD
     );
 
     // struct for exchange information

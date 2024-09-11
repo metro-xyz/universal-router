@@ -23,29 +23,58 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
     error V2TooMuchRequested();
     error V2InvalidPath();
 
-    function _v2Swap(address[] calldata path, address recipient, address pair) private {
+    struct SwapStep {
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 feeInTokenIn;
+        uint256 feeInTokenOut;
+    }
+
+    function _v2Swap(address[] calldata path, address recipient, address pair) private returns (SwapStep[] memory swapSteps) {
         unchecked {
             if (path.length < 2) revert V2InvalidPath();
 
-            // cached to save on duplicate operations
+            swapSteps = new SwapStep[](path.length - 1);
             (address token0,) = UniswapV2Library.sortTokens(path[0], path[1]);
             uint256 finalPairIndex = path.length - 1;
             uint256 penultimatePairIndex = finalPairIndex - 1;
+
             for (uint256 i; i < finalPairIndex; i++) {
                 (address input, address output) = (path[i], path[i + 1]);
                 (uint256 reserve0, uint256 reserve1,) = IUniswapV2Pair(pair).getReserves();
-                (uint256 reserveInput, uint256 reserveOutput) =
+                (uint256 reserveIn, uint256 reserveOut) =
                     input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
-                uint256 amountInput = ERC20(input).balanceOf(pair) - reserveInput;
-                uint256 amountOutput = UniswapV2Library.getAmountOut(amountInput, reserveInput, reserveOutput);
+
+                uint256 amountInput = ERC20(input).balanceOf(pair) - reserveIn;
+                uint256 amountOutput = UniswapV2Library.getAmountOut(amountInput, reserveIn, reserveOut);
+
+                // Calculate fee in input token (0.3% fee)
+                uint256 feeInTokenIn = amountInput * 3 / 1000;
+
+                // Calculate fee in output token
+                uint256 amountInWithFee = amountInput * 997;
+                uint256 numerator = amountInWithFee * reserveOut;
+                uint256 denominator = reserveIn * 1000 + amountInWithFee;
+                uint256 amountOutWithoutFee = numerator / denominator;
+                uint256 feeInTokenOut = amountOutWithoutFee - amountOutput;
+
+                swapSteps[i] = SwapStep({
+                    amountIn: amountInput,
+                    amountOut: amountOutput,
+                    feeInTokenIn: feeInTokenIn,
+                    feeInTokenOut: feeInTokenOut
+                });
+
                 (uint256 amount0Out, uint256 amount1Out) =
                     input == token0 ? (uint256(0), amountOutput) : (amountOutput, uint256(0));
+
                 address nextPair;
                 (nextPair, token0) = i < penultimatePairIndex
                     ? UniswapV2Library.pairAndToken0For(
                         UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, output, path[i + 2]
                     )
                     : (recipient, address(0));
+
                 IUniswapV2Pair(pair).swap(amount0Out, amount1Out, nextPair, new bytes(0));
                 pair = nextPair;
             }
@@ -67,12 +96,20 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
     ) internal {
         uint256 amountInHolder = amountIn;
 
-        // Get the pool trade route from calldata path
+        // Get the pool trade route from calldata path and initialize the trader balance struct
         PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
 
         address firstPair =
-                            UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
-        if (amountIn != Constants.ALREADY_PAID) {
+            UniswapV2Library.pairFor(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
+        if (
+            amountIn != Constants.ALREADY_PAID // amountIn of 0 to signal that the pair already has the tokens
+        ) {
             uint256 payerBalanceBefore = ERC20(path[0]).balanceOf(payer);
             payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
             uint256 payerBalanceAfter = ERC20(path[0]).balanceOf(payer);
@@ -82,7 +119,7 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         ERC20 tokenOut = ERC20(path[path.length - 1]);
         uint256 balanceBefore = tokenOut.balanceOf(recipient);
 
-        _v2Swap(path, recipient, firstPair);
+        SwapStep[] memory swapSteps = _v2Swap(path, recipient, firstPair);
 
         uint256 amountOut = tokenOut.balanceOf(recipient) - balanceBefore;
         if (amountOut < amountOutMinimum) revert V2TooLittleReceived();
@@ -94,14 +131,6 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
 
-        // Initialize trader balance struct
-        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
-            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
-            tokenSoldBalanceAfter: 0,
-            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
-            tokenBoughtBalanceAfter: 0
-        });
-
         // Check before subtracting in case we underflow
         if (traderBalanceDetails.tokenSoldBalanceBefore >= amountInHolder) {
             traderBalanceDetails.tokenSoldBalanceAfter = traderBalanceDetails.tokenSoldBalanceBefore - amountInHolder;
@@ -112,9 +141,12 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
 
         // Calculate swap fees
-        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
-        for (uint256 i = 0; i < tradeRoutePools.length; i++) {
-            swapFees[i] = (i == 0 ? amountInHolder : amountOut) * tradeRoutePools[i].poolFee / 1e6;
+        uint256[] memory swapFees = new uint256[](swapSteps.length);
+        uint256[] memory swapFeesUSD = new uint256[](swapSteps.length);
+
+        for (uint i = 0; i < swapSteps.length; i++) {
+            swapFees[i] = swapSteps[i].feeInTokenIn;
+            swapFeesUSD[i] = getUSDAmount(path[i], path[i+1], swapSteps[i].feeInTokenIn, swapSteps[i].feeInTokenOut);
         }
 
         // Emit shadow event
@@ -129,7 +161,8 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
             tradeRoutePools,
             traderBalanceDetails,
             "AMM", // tradeType
-            swapFees
+            swapFees,
+            swapFeesUSD
         );
     }
 
@@ -146,15 +179,22 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         address[] calldata path,
         address payer
     ) internal {
-        // Get the pool trade route from calldata path
+        // Get the pool trade route from calldata path and initialize the trader balance struct
         PoolInfo[] memory tradeRoutePools = getPoolsFromPath(path);
+        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
+            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
+            tokenSoldBalanceAfter: 0,
+            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
+            tokenBoughtBalanceAfter: 0
+        });
 
         (uint256 amountIn, address firstPair) =
-                            UniswapV2Library.getAmountInMultihop(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, amountOut, path);
+            UniswapV2Library.getAmountInMultihop(UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR_INIT_CODE_HASH, amountOut, path);
         if (amountIn > amountInMaximum) revert V2TooMuchRequested();
 
         payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
-        _v2Swap(path, recipient, firstPair);
+
+        SwapStep[] memory swapSteps = _v2Swap(path, recipient, firstPair);
 
         uint256 amountSoldUsd = getUSDAmount(path[0], path[path.length - 1], amountIn, amountOut);
 
@@ -162,14 +202,6 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         ExchangeInfo memory exchangeInfo = getExchangeInfoV2();
         TokenInfo memory tokenSoldInfo = getTokenInfo(path[0]);
         TokenInfo memory tokenBoughtInfo = getTokenInfo(path[path.length - 1]);
-
-        // Initialize trader balance struct
-        TraderBalanceDetails memory traderBalanceDetails = TraderBalanceDetails({
-            tokenSoldBalanceBefore: getTraderTokenBalance(tx.origin, path[0]),
-            tokenSoldBalanceAfter: 0,
-            tokenBoughtBalanceBefore: getTraderTokenBalance(tx.origin, path[path.length - 1]),
-            tokenBoughtBalanceAfter: 0
-        });
 
         // Check before subtracting in case we underflow
         if (traderBalanceDetails.tokenSoldBalanceBefore >= amountIn) {
@@ -181,9 +213,12 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
         traderBalanceDetails.tokenBoughtBalanceAfter = traderBalanceDetails.tokenBoughtBalanceBefore + amountOut;
 
         // Calculate swap fees
-        uint256[] memory swapFees = new uint256[](tradeRoutePools.length);
-        for (uint256 i = 0; i < tradeRoutePools.length; i++) {
-            swapFees[i] = (i == 0 ? amountIn : amountOut) * tradeRoutePools[i].poolFee / 1e6;
+        uint256[] memory swapFees = new uint256[](swapSteps.length);
+        uint256[] memory swapFeesUSD = new uint256[](swapSteps.length);
+
+        for (uint i = 0; i < swapSteps.length; i++) {
+            swapFees[i] = swapSteps[i].feeInTokenIn;
+            swapFeesUSD[i] = getUSDAmount(path[i], path[i+1], swapSteps[i].feeInTokenIn, swapSteps[i].feeInTokenOut);
         }
 
         // Emit shadow event
@@ -198,7 +233,8 @@ abstract contract V2SwapRouter is RouterImmutables, Permit2Payments {
             tradeRoutePools,
             traderBalanceDetails,
             "AMM", // tradeType
-            swapFees
+            swapFees,
+            swapFeesUSD
         );
     }
 
